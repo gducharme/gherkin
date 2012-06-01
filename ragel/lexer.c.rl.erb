@@ -20,11 +20,6 @@
     rb_str_new(ptr, len)
 #endif
 
-#define LF_FLAG      0
-#define CRLF_FLAG    1
-#define LF           "\n"
-#define CRLF         "\r\n"
-
 #ifndef RSTRING_PTR
 #define RSTRING_PTR(s) (RSTRING(s)->ptr)
 #endif
@@ -44,7 +39,6 @@ typedef struct lexer_state {
   int line_number;
   int current_line;
   int start_col;
-  int eol;
   size_t mark;
   size_t keyword_start;
   size_t keyword_end;
@@ -57,6 +51,7 @@ typedef struct lexer_state {
 } lexer_state;
 
 static VALUE mGherkin;
+static VALUE mGherkinLexer;
 static VALUE mCLexer;
 static VALUE cI18nLexer;
 static VALUE rb_eGherkinLexingError;
@@ -69,7 +64,7 @@ static VALUE rb_eGherkinLexingError;
   store_multiline_kw_con(listener, # EVENT, \
     PTR_TO(keyword_start), LEN(keyword_start, PTR_TO(keyword_end - 1)), \
     PTR_TO(content_start), LEN(content_start, PTR_TO(content_end)), \
-    lexer->current_line, lexer->eol); \
+    lexer->current_line, lexer->start_col); \
     if (lexer->content_end != 0) { \
       p = PTR_TO(content_end - 1); \
     } \
@@ -84,8 +79,9 @@ static VALUE rb_eGherkinLexingError;
   machine lexer;
  
   action begin_content {
-		MARK(content_start, p);
+                MARK(content_start, p);
     lexer->current_line = lexer->line_number;
+    lexer->start_col = lexer->content_start - lexer->last_newline - (lexer->keyword_end - lexer->keyword_start) + 2;
   }
   
   action begin_pystring_content {
@@ -175,15 +171,18 @@ static VALUE rb_eGherkinLexingError;
   }
   
   action begin_cell_content {
-		MARK(content_start, p);
+                MARK(content_start, p);
   }
 
   action store_cell_content {
+    VALUE re_pipe, re_newline, re_backslash;
     VALUE con = ENCODED_STR_NEW(PTR_TO(content_start), LEN(content_start, p));
     rb_funcall(con, rb_intern("strip!"), 0);
-    VALUE re_pipe      = rb_reg_regcomp(rb_str_new2("\\\\\\|"));
-    VALUE re_backslash = rb_reg_regcomp(rb_str_new2("\\\\\\\\"));
+    re_pipe      = rb_reg_regcomp(rb_str_new2("\\\\\\|"));
+    re_newline   = rb_reg_regcomp(rb_str_new2("\\\\n"));
+    re_backslash = rb_reg_regcomp(rb_str_new2("\\\\\\\\"));
     rb_funcall(con, rb_intern("gsub!"), 2, re_pipe,      rb_str_new2("|"));
+    rb_funcall(con, rb_intern("gsub!"), 2, re_newline,   rb_str_new2("\n"));
     rb_funcall(con, rb_intern("gsub!"), 2, re_backslash, rb_str_new2("\\"));
 
     rb_ary_push(current_row, con);
@@ -194,10 +193,13 @@ static VALUE rb_eGherkinLexingError;
   }
 
   action end_feature {
+    int line;
     if (cs < lexer_first_final) {
       if (raise_lexer_error != NULL) {
         size_t count = 0;
-        int newstr_count = 0;
+        VALUE newstr_val;
+        char *newstr;
+        int newstr_count = 0;        
         size_t len;
         const char *buff;
         if (lexer->last_newline != 0) {
@@ -208,7 +210,10 @@ static VALUE rb_eGherkinLexingError;
           buff = data;
         }
 
-        char newstr[len]; 
+        // Allocate as a ruby string so that it gets cleaned up by GC
+        newstr_val = rb_str_new(buff, len);
+        newstr = RSTRING_PTR(newstr_val);
+
 
         for (count = 0; count < len; count++) {
           if(buff[count] == 10) {
@@ -225,7 +230,7 @@ static VALUE rb_eGherkinLexingError;
           newstr_count++;
         }
 
-        int line = lexer->line_number;
+        line = lexer->line_number;
         lexer_init(lexer); // Re-initialize so we can scan again with the same lexer
         raise_lexer_error(newstr, line);
       }
@@ -242,23 +247,17 @@ static VALUE rb_eGherkinLexingError;
 %% write data;
 
 static VALUE 
-strip_i(VALUE str, VALUE ary)
+unindent(VALUE con, int start_col)
 {
-  rb_funcall(str, rb_intern("strip!"), 0);
-  rb_ary_push(ary, str);
-  
-  return Qnil;
-}
+  VALUE re;
+  // Gherkin will crash gracefully if the string representation of start_col pushes the pattern past 32 characters
+  char pat[32]; 
+  snprintf(pat, 32, "^[\t ]{0,%d}", start_col); 
+  re = rb_reg_regcomp(rb_str_new2(pat));
+  rb_funcall(con, rb_intern("gsub!"), 2, re, rb_str_new2(""));
 
-static VALUE 
-multiline_strip(VALUE text)
-{
-  VALUE map = rb_ary_new();
-  VALUE split = rb_str_split(text, "\n");
-  
-  rb_iterate(rb_each, split, strip_i, map);
-  
-  return split;
+  return Qnil;
+
 }
 
 static void 
@@ -278,18 +277,20 @@ static void
 store_multiline_kw_con(VALUE listener, const char * event_name,
                       const char * keyword_at, size_t keyword_length,
                       const char * at,         size_t length,
-                      int current_line, int eol)
+                      int current_line, int start_col)
 {
+  VALUE split;
   VALUE con = Qnil, kw = Qnil, name = Qnil, desc = Qnil;
 
   kw = ENCODED_STR_NEW(keyword_at, keyword_length);
   con = ENCODED_STR_NEW(at, length);
 
-  VALUE split = multiline_strip(con);
+  unindent(con, start_col);
   
+  split = rb_str_split(con, "\n");
+
   name = rb_funcall(split, rb_intern("shift"), 0);
-  desc = rb_ary_join(split, rb_str_new2( \
-          eol == CRLF_FLAG ? CRLF : LF ));
+  desc = rb_ary_join(split, rb_str_new2( "\n" ));
 
   if( name == Qnil ) 
   {
@@ -300,7 +301,7 @@ store_multiline_kw_con(VALUE listener, const char * event_name,
     desc = rb_str_new2("");
   }
   rb_funcall(name, rb_intern("strip!"), 0);
-  rb_funcall(desc, rb_intern("strip!"), 0);
+  rb_funcall(desc, rb_intern("rstrip!"), 0);
   rb_funcall(listener, rb_intern(event_name), 4, kw, name, desc, INT2FIX(current_line)); 
 }
 
@@ -319,14 +320,14 @@ store_pystring_content(VALUE listener,
           const char *at, size_t length, 
           int current_line)
 {
+  VALUE re2;
+  VALUE unescape_escaped_quotes;
   VALUE con = ENCODED_STR_NEW(at, length);
-  // Gherkin will crash gracefully if the string representation of start_col pushes the pattern past 32 characters
-  char pat[32]; 
-  snprintf(pat, 32, "^[\t ]{0,%d}", start_col); 
-  VALUE re = rb_reg_regcomp(rb_str_new2(pat));
-  VALUE re2 = rb_reg_regcomp(rb_str_new2("\r\\Z"));
-  VALUE unescape_escaped_quotes = rb_reg_regcomp(rb_str_new2("\\\\\"\\\\\"\\\\\""));
-  rb_funcall(con, rb_intern("gsub!"), 2, re, rb_str_new2(""));
+
+  unindent(con, start_col);
+
+  re2 = rb_reg_regcomp(rb_str_new2("\r\\Z"));
+  unescape_escaped_quotes = rb_reg_regcomp(rb_str_new2("\\\\\"\\\\\"\\\\\""));
   rb_funcall(con, rb_intern("sub!"), 2, re2, rb_str_new2(""));
   rb_funcall(con, rb_intern("gsub!"), 2, unescape_escaped_quotes, rb_str_new2("\"\"\""));
   rb_funcall(listener, rb_intern("py_string"), 2, con, INT2FIX(current_line));
@@ -336,20 +337,6 @@ static void
 raise_lexer_error(const char * at, int line)
 { 
   rb_raise(rb_eGherkinLexingError, "Lexing error on line %d: '%s'. See http://wiki.github.com/aslakhellesoy/gherkin/lexingerror for more information.", line, at);
-}
-
-static int 
-count_char(char char_to_count, char *str) {
-
-  int count = 0;
-  int i = 0;
-  while(str[i] != '\0') {
-    if(str[i] == char_to_count) {
-      count++;
-    }
-    i++;
-  }
-  return count;
 }
 
 static void lexer_init(lexer_state *lexer) {
@@ -364,7 +351,6 @@ static void lexer_init(lexer_state *lexer) {
   lexer->last_newline = 0;
   lexer->final_newline = 0;
   lexer->start_col = 0;
-  lexer->eol = LF_FLAG;
 }
 
 static VALUE CLexer_alloc(VALUE klass)
@@ -380,9 +366,10 @@ static VALUE CLexer_alloc(VALUE klass)
 
 static VALUE CLexer_init(VALUE self, VALUE listener)
 {
+  lexer_state *lxr; 
   rb_iv_set(self, "@listener", listener);
   
-  lexer_state *lxr = NULL;
+  lxr = NULL;
   DATA_GET(self, lexer_state, lxr);
   lexer_init(lxr);
   
@@ -391,20 +378,20 @@ static VALUE CLexer_init(VALUE self, VALUE listener)
 
 static VALUE CLexer_scan(VALUE self, VALUE input)
 {
+  VALUE input_copy;
+  char *data;
+  size_t len;
   VALUE listener = rb_iv_get(self, "@listener");
 
-  lexer_state *lexer = NULL;
+  lexer_state *lexer;
+  lexer = NULL;
   DATA_GET(self, lexer_state, lexer);
 
-  VALUE input_copy = rb_str_dup(input);
+  input_copy = rb_str_dup(input);
 
   rb_str_append(input_copy, rb_str_new2("\n%_FEATURE_END_%"));
-  char *data = RSTRING_PTR(input_copy);
-  size_t len = RSTRING_LEN(input_copy);
-  
-  if (count_char('\r', data) > (count_char('\n', data) / 2)) {
-    lexer->eol = CRLF_FLAG;
-  }
+  data = RSTRING_PTR(input_copy);
+  len = RSTRING_LEN(input_copy);
   
   if (len == 0) { 
     rb_raise(rb_eGherkinLexingError, "No content to lex.");
@@ -442,7 +429,8 @@ static VALUE CLexer_scan(VALUE self, VALUE input)
 void Init_gherkin_lexer_<%= @i18n.underscored_iso_code %>()
 {
   mGherkin = rb_define_module("Gherkin");
-  rb_eGherkinLexingError = rb_const_get(mGherkin, rb_intern("LexingError"));
+  mGherkinLexer = rb_define_module_under(mGherkin, "Lexer");
+  rb_eGherkinLexingError = rb_const_get(mGherkinLexer, rb_intern("LexingError"));
 
   mCLexer = rb_define_module_under(mGherkin, "CLexer");
   cI18nLexer = rb_define_class_under(mCLexer, "<%= @i18n.underscored_iso_code.capitalize %>", rb_cObject);
